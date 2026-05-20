@@ -52,6 +52,9 @@ constexpr int kMinTargetFps = 5;
 constexpr int kMaxTargetFps = 240;
 constexpr int kMinCenterDotSize = 3;
 constexpr int kMaxCenterDotSize = 31;
+constexpr UINT kMaxGuardedUpdateIntervalMs = 33;
+constexpr double kUpdateGuardBudgetFraction = 0.50;
+constexpr double kUpdateGuardSmoothing = 0.15;
 
 constexpr UINT_PTR kUpdateTimerId = 1;
 constexpr UINT_PTR kTriggerCaptureTimerId = 2;
@@ -179,6 +182,7 @@ HICON g_trayIcon = nullptr;
 HHOOK g_mouseHook = nullptr;
 bool g_isVisible = false;
 bool g_highResolutionTimerActive = false;
+double g_averageUpdateDurationMs = 0.0;
 AppConfig g_config = {};
 std::atomic<int> g_inputModeValue = static_cast<int>(InputMode::Toggle);
 std::atomic<int> g_triggerVirtualKeyValue = kDefaultTriggerVirtualKey;
@@ -194,6 +198,7 @@ void ApplyZoomModifierVirtualKey(int virtualKey);
 void ApplyCenterDotEnabled(bool enabled);
 void UpdateCenterDotWindow();
 void UpdateTrayIcon();
+void ResetUpdatePerformanceGuard();
 bool StartInputMonitor();
 void StopInputMonitor();
 bool StartMouseWheelHook();
@@ -1011,6 +1016,67 @@ bool UpdateMagnifierSource()
     return sourceUpdated;
 }
 
+double MeasureMagnifierSourceUpdate()
+{
+    LARGE_INTEGER frequency = {};
+    LARGE_INTEGER startedAt = {};
+    LARGE_INTEGER finishedAt = {};
+
+    if (!QueryPerformanceFrequency(&frequency) || !QueryPerformanceCounter(&startedAt))
+    {
+        UpdateMagnifierSource();
+        return 0.0;
+    }
+
+    UpdateMagnifierSource();
+
+    if (!QueryPerformanceCounter(&finishedAt))
+    {
+        return 0.0;
+    }
+
+    return (static_cast<double>(finishedAt.QuadPart - startedAt.QuadPart) * 1000.0) /
+        static_cast<double>(frequency.QuadPart);
+}
+
+void ResetUpdatePerformanceGuard()
+{
+    g_averageUpdateDurationMs = 0.0;
+}
+
+UINT GetGuardedUpdateIntervalMs(double latestUpdateDurationMs)
+{
+    const UINT baseIntervalMs = GetUpdateIntervalMs(g_config.targetFps);
+    if (latestUpdateDurationMs <= 0.0)
+    {
+        return baseIntervalMs;
+    }
+
+    if (g_averageUpdateDurationMs <= 0.0)
+    {
+        g_averageUpdateDurationMs = latestUpdateDurationMs;
+    }
+    else
+    {
+        g_averageUpdateDurationMs =
+            (g_averageUpdateDurationMs * (1.0 - kUpdateGuardSmoothing)) +
+            (latestUpdateDurationMs * kUpdateGuardSmoothing);
+    }
+
+    const double budgetMs = static_cast<double>(baseIntervalMs) * kUpdateGuardBudgetFraction;
+    if (g_averageUpdateDurationMs <= budgetMs)
+    {
+        return baseIntervalMs;
+    }
+
+    const int guardedInterval =
+        static_cast<int>(std::ceil(g_averageUpdateDurationMs / kUpdateGuardBudgetFraction));
+    return static_cast<UINT>(ClampInt(
+        guardedInterval,
+        static_cast<int>(baseIntervalMs),
+        static_cast<int>(kMaxGuardedUpdateIntervalMs)));
+}
+
 void EnableHighResolutionTimer()
 {
     if (!g_highResolutionTimerActive && timeBeginPeriod(1) == TIMERR_NOERROR)
@@ -1741,6 +1807,7 @@ void StartMagnifierUpdates()
 
     KillTimer(g_hostWindow, kUpdateTimerId);
     EnableHighResolutionTimer();
+    ResetUpdatePerformanceGuard();
     SetTimer(g_hostWindow, kUpdateTimerId, GetUpdateIntervalMs(g_config.targetFps), nullptr);
 }
 
@@ -2523,7 +2590,12 @@ LRESULT CALLBACK HostWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM
     case WM_TIMER:
         if (wParam == kUpdateTimerId)
         {
-            UpdateMagnifierSource();
+            KillTimer(window, kUpdateTimerId);
+            const double updateDurationMs = MeasureMagnifierSourceUpdate();
+            if (g_isVisible)
+            {
+                SetTimer(window, kUpdateTimerId, GetGuardedUpdateIntervalMs(updateDurationMs), nullptr);
+            }
             return 0;
         }
         break;
